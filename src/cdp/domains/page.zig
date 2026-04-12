@@ -396,6 +396,7 @@ pub fn pageCreated(bc: *CDP.BrowserContext, page: *Page) !void {
     // Only retain captured responses until a navigation event. In CDP term,
     // this is called a "renderer" and the cache-duration can be controlled via
     // the Network.configureDurableMessages message (which we don't support)
+    bc.captured_requests = .empty;
     bc.captured_responses = .empty;
 }
 

@@ -312,6 +312,12 @@ pub const BrowserContext = struct {
     const Node = @import("Node.zig");
     const AXNode = @import("AXNode.zig");
 
+    pub const CapturedRequest = struct {
+        has_post_data: bool,
+        body: ?[]const u8,
+        inline_in_events: bool,
+    };
+
     const CapturedResponse = struct {
         must_encode: bool,
         data: std.ArrayList(u8),
@@ -374,6 +380,10 @@ pub const BrowserContext = struct {
 
     intercept_state: InterceptState,
 
+    network_max_post_data_size: ?usize = null,
+
+    captured_requests: std.AutoHashMapUnmanaged(usize, CapturedRequest),
+
     // When network is enabled, we'll capture the transfer.id -> body
     // This is awfully memory intensive, but our underlying http client and
     // its users (script manager and page) correctly do not hold the body
@@ -418,6 +428,7 @@ pub const BrowserContext = struct {
             .arena = cdp.browser_context_arena.allocator(),
             .notification_arena = cdp.notification_arena.allocator(),
             .intercept_state = try InterceptState.init(allocator),
+            .captured_requests = .empty,
             .captured_responses = .empty,
             .notification = notification,
         };
@@ -619,11 +630,13 @@ pub const BrowserContext = struct {
 
     pub fn onHttpRequestStart(ctx: *anyopaque, msg: *const Notification.RequestStart) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        defer self.resetNotificationArena();
         try @import("domains/network.zig").httpRequestStart(self, msg);
     }
 
     pub fn onHttpRequestIntercept(ctx: *anyopaque, msg: *const Notification.RequestIntercept) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        defer self.resetNotificationArena();
         try @import("domains/fetch.zig").requestIntercept(self, msg);
     }
 

@@ -640,6 +640,21 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/xhr/echo")) {
+        var recv_buf: [1024]u8 = undefined;
+        const body = if (req.head.content_length) |content_length|
+            try req.readerExpectNone(&recv_buf).readAlloc(allocator, @intCast(content_length))
+        else
+            try allocator.dupe(u8, "");
+        defer allocator.free(body);
+
+        return req.respond(body, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+            },
+        });
+    }
+
     if (std.mem.startsWith(u8, path, "/src/browser/tests/")) {
         // strip off leading / so that it's relative to CWD
         return TestHTTPServer.sendFile(req, path[1..]);

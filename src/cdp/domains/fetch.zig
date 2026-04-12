@@ -193,11 +193,12 @@ pub fn requestIntercept(bc: *CDP.BrowserContext, intercept: *const Notification.
 
     const transfer = intercept.transfer;
     try bc.intercept_state.put(transfer);
+    const captured_request = bc.captured_requests.getPtr(transfer.id);
 
     try bc.cdp.sendEvent("Fetch.requestPaused", .{
         .requestId = &id.toInterceptId(transfer.id),
         .frameId = &id.toFrameId(transfer.req.frame_id),
-        .request = network.TransferAsRequestWriter.init(transfer),
+        .request = network.TransferAsRequestWriter.init(bc.notification_arena, transfer, captured_request),
         .resourceType = switch (transfer.req.resource_type) {
             .script => "Script",
             .xhr => "XHR",
@@ -395,13 +396,14 @@ pub fn requestAuthRequired(bc: *CDP.BrowserContext, intercept: *const Notificati
 
     const transfer = intercept.transfer;
     try bc.intercept_state.put(transfer);
+    const captured_request = bc.captured_requests.getPtr(transfer.id);
 
     const challenge = transfer._auth_challenge orelse return error.NullAuthChallenge;
 
     try bc.cdp.sendEvent("Fetch.authRequired", .{
         .requestId = &id.toInterceptId(transfer.id),
         .frameId = &id.toFrameId(transfer.req.frame_id),
-        .request = network.TransferAsRequestWriter.init(transfer),
+        .request = network.TransferAsRequestWriter.init(bc.notification_arena, transfer, captured_request),
         .resourceType = switch (transfer.req.resource_type) {
             .script => "Script",
             .xhr => "XHR",
