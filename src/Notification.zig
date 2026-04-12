@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
 const log = @import("log.zig");
 const Page = @import("browser/Page.zig");
 const Transfer = @import("browser/HttpClient.zig").Transfer;
+const Header = @import("network/http.zig").Header;
 
 const Allocator = std.mem.Allocator;
 
@@ -157,11 +158,14 @@ pub const PageLoaded = struct {
 
 pub const RequestStart = struct {
     transfer: *Transfer,
+    redirect_response: ?*const RedirectResponse = null,
 };
 
 pub const RequestIntercept = struct {
     transfer: *Transfer,
     wait_for_interception: *bool,
+    fetch_request_id: u32,
+    redirected_from_fetch_request_id: ?u32 = null,
 };
 
 pub const RequestAuthRequired = struct {
@@ -185,6 +189,13 @@ pub const RequestDone = struct {
 pub const RequestFail = struct {
     transfer: *Transfer,
     err: anyerror,
+};
+
+pub const RedirectResponse = struct {
+    url: [:0]const u8,
+    status: u16,
+    headers: []const Header,
+    content_type: ?[]const u8 = null,
 };
 
 pub const JavascriptDialogOpening = struct {

@@ -83,6 +83,7 @@ performing: bool = false,
 
 // Use to generate the next request ID
 next_request_id: u32 = 0,
+next_fetch_request_id: u32 = 0,
 
 // When handles has no more available easys, requests get queued.
 queue: std.DoublyLinkedList = .{},
@@ -283,12 +284,20 @@ fn _abort(self: *Client, comptime abort_all: bool, frame_id: u32) void {
 
 pub fn tick(self: *Client, timeout_ms: u32) !PerformStatus {
     while (self.queue.popFirst()) |queue_node| {
+        const transfer: *Transfer = @fieldParentPtr("_node", queue_node);
+        if (transfer._detached_conn != null) {
+            const conn = transfer._detached_conn.?;
+            transfer._detached_conn = null;
+            try self.makeRequest(conn, transfer);
+            continue;
+        }
+
         const conn = self.network.getConnection() orelse {
             self.queue.prepend(queue_node);
             break;
         };
 
-        try self.makeRequest(conn, @fieldParentPtr("_node", queue_node));
+        try self.makeRequest(conn, transfer);
     }
 
     return self.perform(@intCast(timeout_ms));
@@ -393,35 +402,7 @@ fn processRequest(self: *Client, req: Request) !void {
     }
 
     const transfer = try self.makeTransfer(req);
-
-    transfer.req.notification.dispatch(.http_request_start, &.{ .transfer = transfer });
-
-    var wait_for_interception = false;
-    transfer.req.notification.dispatch(.http_request_intercept, &.{
-        .transfer = transfer,
-        .wait_for_interception = &wait_for_interception,
-    });
-    if (wait_for_interception == false) {
-        // request not intercepted, process it normally
-        return self.process(transfer);
-    }
-
-    self.intercepted += 1;
-    if (comptime IS_DEBUG) {
-        log.debug(.http, "wait for interception", .{ .intercepted = self.intercepted });
-    }
-    transfer._intercept_state = .pending;
-
-    if (req.blocking == false) {
-        // The request was interecepted, but it isn't a blocking request, so we
-        // dont' need to block this call. The request will be unblocked
-        // asynchronously via either continueTransfer or abortTransfer
-        return;
-    }
-
-    if (try self.waitForInterceptedResponse(transfer)) {
-        return self.process(transfer);
-    }
+    return self.startRequestHop(transfer);
 }
 
 const RobotsRequestContext = struct {
@@ -639,6 +620,12 @@ fn waitForInterceptedResponse(self: *Client, transfer: *Transfer) !bool {
 // cases, the interceptor is expected to call resume to continue the transfer
 // or transfer.abort() to abort it.
 fn process(self: *Client, transfer: *Transfer) !void {
+    if (transfer._detached_conn != null and !self.performing) {
+        const conn = transfer._detached_conn.?;
+        transfer._detached_conn = null;
+        return self.makeRequest(conn, transfer);
+    }
+
     // libcurl doesn't allow recursive calls, if we're in a `perform()` operation
     // then we _have_ to queue this.
     if (self.performing == false) {
@@ -648,6 +635,43 @@ fn process(self: *Client, transfer: *Transfer) !void {
     }
 
     self.queue.append(&transfer._node);
+}
+
+fn startRequestHop(self: *Client, transfer: *Transfer) !void {
+    try transfer.snapshotHopHeaders();
+    transfer.previous_fetch_request_id = if (transfer.fetch_request_id == 0) null else transfer.fetch_request_id;
+    transfer.fetch_request_id = self.incrFetchReqId();
+
+    transfer.req.notification.dispatch(.http_request_start, &.{
+        .transfer = transfer,
+        .redirect_response = if (transfer._redirect_response) |*response| response else null,
+    });
+    transfer._redirect_response = null;
+
+    var wait_for_interception = false;
+    transfer.req.notification.dispatch(.http_request_intercept, &.{
+        .transfer = transfer,
+        .wait_for_interception = &wait_for_interception,
+        .fetch_request_id = transfer.fetch_request_id,
+        .redirected_from_fetch_request_id = transfer.previous_fetch_request_id,
+    });
+    if (!wait_for_interception) {
+        return self.process(transfer);
+    }
+
+    self.intercepted += 1;
+    if (comptime IS_DEBUG) {
+        log.debug(.http, "wait for interception", .{ .intercepted = self.intercepted });
+    }
+    transfer._intercept_state = .pending;
+
+    if (!transfer.req.blocking) {
+        return;
+    }
+
+    if (try self.waitForInterceptedResponse(transfer)) {
+        return self.process(transfer);
+    }
 }
 
 // For an intercepted request
@@ -701,6 +725,12 @@ pub fn nextReqId(self: *Client) u32 {
 pub fn incrReqId(self: *Client) u32 {
     const id = self.next_request_id +% 1;
     self.next_request_id = id;
+    return id;
+}
+
+fn incrFetchReqId(self: *Client) u32 {
+    const id = self.next_fetch_request_id +% 1;
+    self.next_fetch_request_id = id;
     return id;
 }
 
@@ -894,22 +924,24 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
     if (msg.err == null) {
         const status = try msg.conn.getResponseCode();
         if (status >= 300 and status <= 399) {
+            if (transfer.response_header == null) {
+                try transfer.buildResponseHeader(msg.conn);
+            }
+            transfer.req.notification.dispatch(.http_response_header_done, &.{
+                .transfer = transfer,
+            });
+            try transfer.snapshotRedirectResponse();
             try transfer.handleRedirect();
+            try transfer.restoreHopHeaders();
 
             const conn = transfer._conn.?;
 
             try self.handles.remove(conn);
             transfer._conn = null;
-            transfer._detached_conn = conn; // signal orphan for processMessages cleanup
+            transfer._detached_conn = conn;
 
             transfer.reset();
-            try transfer.configureConn(conn);
-            try self.handles.add(conn);
-            transfer._detached_conn = null;
-            transfer._conn = conn; // reattach after successful re-add
-
-            _ = try self.perform(0);
-
+            try self.startRequestHop(transfer);
             return false;
         }
     }
@@ -1197,6 +1229,8 @@ pub const Response = struct {
 pub const Transfer = struct {
     arena: ArenaAllocator,
     id: u32 = 0,
+    fetch_request_id: u32 = 0,
+    previous_fetch_request_id: ?u32 = null,
     req: Request,
     url: [:0]const u8,
     client: *Client,
@@ -1220,6 +1254,8 @@ pub const Transfer = struct {
     // reconfiguration. Used by processMessages to release the orphaned conn
     // if reconfiguration fails.
     _detached_conn: ?*http.Connection = null,
+    _redirect_response: ?Notification.RedirectResponse = null,
+    _hop_request_headers: ?[]const http.Header = null,
 
     _auth_challenge: ?http.AuthChallenge = null,
 
@@ -1254,12 +1290,22 @@ pub const Transfer = struct {
             self.client.removeConn(conn);
             self._conn = null;
         }
+
+        if (self._detached_conn) |conn| {
+            self.client.releaseConn(conn);
+            self._detached_conn = null;
+        }
     }
 
     fn deinit(self: *Transfer) void {
         if (self._conn) |conn| {
             self.client.removeConn(conn);
             self._conn = null;
+        }
+
+        if (self._detached_conn) |conn| {
+            self.client.releaseConn(conn);
+            self._detached_conn = null;
         }
 
         self.req.headers.deinit();
@@ -1393,6 +1439,32 @@ pub const Transfer = struct {
         self._callback_error = null;
         self._skip_body = false;
         self._first_data_received = false;
+    }
+
+    fn snapshotHopHeaders(self: *Transfer) !void {
+        var iter = self.req.headers.iterator();
+        const list = try iter.collect(self.arena.allocator());
+        self._hop_request_headers = try list.toOwnedSlice(self.arena.allocator());
+    }
+
+    fn restoreHopHeaders(self: *Transfer) !void {
+        const headers = self._hop_request_headers orelse return;
+        try self.replaceRequestHeaders(self.arena.allocator(), headers);
+    }
+
+    fn snapshotRedirectResponse(self: *Transfer) !void {
+        const arena = self.arena.allocator();
+        const rh = self.response_header orelse return error.NullResponseHeader;
+
+        var iter = self.responseHeaderIterator();
+        const header_list = try iter.collect(arena);
+
+        self._redirect_response = .{
+            .url = try arena.dupeZ(u8, std.mem.span(rh.url)),
+            .status = rh.status,
+            .headers = try header_list.toOwnedSlice(arena),
+            .content_type = if (rh.contentType()) |ct| try arena.dupe(u8, ct) else null,
+        };
     }
 
     fn buildResponseHeader(self: *Transfer, conn: *const http.Connection) !void {

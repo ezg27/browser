@@ -24,8 +24,10 @@ const log = @import("../../log.zig");
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
 
+const HttpClient = @import("../../browser/HttpClient.zig");
+const Page = @import("../../browser/Page.zig");
 const URL = @import("../../browser/URL.zig");
-const Transfer = @import("../../browser/HttpClient.zig").Transfer;
+const Transfer = HttpClient.Transfer;
 const Notification = @import("../../Notification.zig");
 const Mime = @import("../../browser/Mime.zig");
 
@@ -274,6 +276,7 @@ pub fn httpRequestStart(bc: *CDP.BrowserContext, msg: *const Notification.Reques
         .documentURL = page.url,
         .request = TransferAsRequestWriter.init(transfer),
         .initiator = .{ .type = "other" },
+        .redirectResponse = if (msg.redirect_response) |response| RedirectResponseWriter.init(bc.notification_arena, response) else null,
         .redirectHasExtraInfo = false, // TODO change after adding Network.requestWillBeSentExtraInfo
         .hasUserGesture = false,
     }, .{ .session_id = session_id });
@@ -437,6 +440,70 @@ const TransferAsResponseWriter = struct {
     }
 };
 
+const RedirectResponseWriter = struct {
+    arena: Allocator,
+    response: *const Notification.RedirectResponse,
+
+    fn init(arena: Allocator, response: *const Notification.RedirectResponse) RedirectResponseWriter {
+        return .{ .arena = arena, .response = response };
+    }
+
+    pub fn jsonStringify(self: *const RedirectResponseWriter, jws: anytype) !void {
+        self._jsonStringify(jws) catch return error.WriteFailed;
+    }
+
+    fn _jsonStringify(self: *const RedirectResponseWriter, jws: anytype) !void {
+        const response = self.response;
+
+        try jws.beginObject();
+        {
+            try jws.objectField("url");
+            try jws.write(response.url);
+        }
+
+        {
+            try jws.objectField("status");
+            try jws.write(response.status);
+        }
+
+        {
+            try jws.objectField("statusText");
+            try jws.write(@as(std.http.Status, @enumFromInt(response.status)).phrase() orelse "Unknown");
+        }
+
+        {
+            const mime: Mime = blk: {
+                if (response.content_type) |ct| {
+                    break :blk try Mime.parse(ct);
+                }
+                break :blk .unknown;
+            };
+
+            try jws.objectField("mimeType");
+            try jws.write(mime.contentTypeString());
+            try jws.objectField("charset");
+            try jws.write(mime.charsetString());
+        }
+
+        {
+            const arena = self.arena;
+            var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+            for (response.headers) |hdr| {
+                const gop = try map.getOrPut(arena, hdr.name);
+                if (gop.found_existing) {
+                    gop.value_ptr.* = try std.mem.join(arena, "\n", &.{ gop.value_ptr.*, hdr.value });
+                } else {
+                    gop.value_ptr.* = hdr.value;
+                }
+            }
+
+            try jws.objectField("headers");
+            try jws.write(std.json.ArrayHashMap([]const u8){ .map = map });
+        }
+        try jws.endObject();
+    }
+};
+
 fn idFromRequestId(request_id: []const u8) !u64 {
     if (!std.mem.startsWith(u8, request_id, "REQ-")) {
         return error.InvalidParams;
@@ -540,4 +607,180 @@ test "cdp.Network: cookies" {
         .params = .{ .browserContextId = "BID-S" },
     });
     try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{} }, .{ .id = 10 });
+}
+
+const RequestState = struct {
+    done: bool = false,
+    err: ?anyerror = null,
+};
+
+fn testHeaderCallback(_: HttpClient.Response) !bool {
+    return true;
+}
+
+fn testDataCallback(_: HttpClient.Response, _: []const u8) !void {}
+
+fn testDoneCallback(ctx: *anyopaque) !void {
+    const state: *RequestState = @ptrCast(@alignCast(ctx));
+    state.done = true;
+}
+
+fn testErrorCallback(ctx: *anyopaque, err: anyerror) void {
+    const state: *RequestState = @ptrCast(@alignCast(ctx));
+    state.err = err;
+}
+
+fn issueRequest(
+    page: *Page,
+    state: *RequestState,
+    url: [:0]const u8,
+    method: HttpClient.Method,
+    body: ?[]const u8,
+) !void {
+    const http_client = page._session.browser.http_client;
+    var headers = try http_client.newHeaders();
+    try headers.add("X-Base: original");
+
+    try http_client.request(.{
+        .ctx = state,
+        .url = url,
+        .method = method,
+        .body = body,
+        .headers = headers,
+        .frame_id = page._frame_id,
+        .resource_type = .fetch,
+        .cookie_jar = &page._session.cookie_jar,
+        .cookie_origin = page.url,
+        .notification = page._session.notification,
+        .header_callback = testHeaderCallback,
+        .data_callback = testDataCallback,
+        .done_callback = testDoneCallback,
+        .error_callback = testErrorCallback,
+    });
+}
+
+fn waitForRequest(bc: *CDP.BrowserContext, state: *RequestState) !void {
+    var runner = try bc.session.runner(.{});
+    var attempts: usize = 0;
+    while (!state.done and state.err == null and attempts < 20) : (attempts += 1) {
+        _ = try runner.tick(.{ .ms = 100 });
+    }
+
+    if (state.err) |err| return err;
+    if (!state.done) return error.Timeout;
+}
+
+test "cdp.Network: requestWillBeSent emitted for redirect hops" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{
+        .id = "BID-NRED",
+        .session_id = "SID-NRED",
+        .target_id = "TID-0000000001".*,
+    });
+    const page = try bc.session.createPage();
+
+    try ctx.processMessage(.{ .id = 20, .method = "Network.enable", .sessionId = "SID-NRED" });
+    try ctx.expectSentResult(null, .{ .id = 20, .session_id = "SID-NRED" });
+
+    var state = RequestState{};
+    try issueRequest(page, &state, "http://127.0.0.1:9582/xhr/redirect", .GET, null);
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{ .url = "http://127.0.0.1:9582/xhr/redirect" },
+    }, .{ .session_id = "SID-NRED" });
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{ .url = "http://127.0.0.1:9582/xhr" },
+        .redirectResponse = .{
+            .url = "http://127.0.0.1:9582/xhr/redirect",
+            .status = 302,
+        },
+    }, .{ .session_id = "SID-NRED" });
+
+    try waitForRequest(bc, &state);
+}
+
+test "cdp.Network: requestWillBeSent keeps one requestId across multiple redirects" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{
+        .id = "BID-NRED2",
+        .session_id = "SID-NRED2",
+        .target_id = "TID-0000000002".*,
+    });
+    const page = try bc.session.createPage();
+
+    try ctx.processMessage(.{ .id = 21, .method = "Network.enable", .sessionId = "SID-NRED2" });
+    try ctx.expectSentResult(null, .{ .id = 21, .session_id = "SID-NRED2" });
+
+    var state = RequestState{};
+    try issueRequest(page, &state, "http://127.0.0.1:9582/xhr/redirect-twice", .GET, null);
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{ .url = "http://127.0.0.1:9582/xhr/redirect-twice" },
+    }, .{ .session_id = "SID-NRED2" });
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{ .url = "http://127.0.0.1:9582/xhr/redirect" },
+        .redirectResponse = .{
+            .url = "http://127.0.0.1:9582/xhr/redirect-twice",
+            .status = 302,
+        },
+    }, .{ .session_id = "SID-NRED2" });
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{ .url = "http://127.0.0.1:9582/xhr" },
+        .redirectResponse = .{
+            .url = "http://127.0.0.1:9582/xhr/redirect",
+            .status = 302,
+        },
+    }, .{ .session_id = "SID-NRED2" });
+
+    try waitForRequest(bc, &state);
+}
+
+test "cdp.Network: redirect 302 rewrites POST to GET on redirected hop" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{
+        .id = "BID-NPOST",
+        .session_id = "SID-NPOST",
+        .target_id = "TID-0000000003".*,
+    });
+    const page = try bc.session.createPage();
+
+    try ctx.processMessage(.{ .id = 22, .method = "Network.enable", .sessionId = "SID-NPOST" });
+    try ctx.expectSentResult(null, .{ .id = 22, .session_id = "SID-NPOST" });
+
+    var state = RequestState{};
+    try issueRequest(page, &state, "http://127.0.0.1:9582/xhr/redirect", .POST, "hello");
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{
+            .url = "http://127.0.0.1:9582/xhr/redirect",
+            .method = "POST",
+        },
+    }, .{ .session_id = "SID-NPOST" });
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = "REQ-0000000001",
+        .request = .{
+            .url = "http://127.0.0.1:9582/xhr",
+            .method = "GET",
+        },
+        .redirectResponse = .{
+            .url = "http://127.0.0.1:9582/xhr/redirect",
+            .status = 302,
+        },
+    }, .{ .session_id = "SID-NPOST" });
+
+    try waitForRequest(bc, &state);
 }

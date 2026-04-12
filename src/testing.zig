@@ -614,6 +614,15 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/xhr/redirect-twice")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "http://127.0.0.1:9582/xhr/redirect" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/xhr/404")) {
         return req.respond("Not Found", .{
             .status = .not_found,
